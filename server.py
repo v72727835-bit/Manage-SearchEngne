@@ -41,17 +41,19 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "8"))
+# Hard limit per source: a slow board is dropped instead of making you wait.
+SOURCE_TIMEOUT = float(os.getenv("SOURCE_TIMEOUT_SECONDS", "6"))
+CACHE_MAX = int(os.getenv("CACHE_MAX_ENTRIES", "300"))
 
 mcp = FastMCP(
     "freelance-lead-finder",
     instructions=(
-        "Finds freelance and contract job leads from public job boards "
-        "(Remotive, RemoteOK, We Work Remotely, Jobicy, Himalayas), Hacker News "
-        "hiring threads and Reddit hiring subreddits. Use find_freelance_leads "
-        "first, then get_lead_details on promising leads, then draft outreach "
-        "with the draft_outreach prompt. Never send messages automatically: "
-        "show drafts to the user for review."
+        "Fast freelance lead finder + GitHub/cPanel/Vercel tools. Flow: one "
+        "find_freelance_leads call (all boards in parallel, ~1-3 s) -> "
+        "get_lead_details only for the 2-3 best -> draft_outreach. Repeat "
+        "searches within 10 min are cached (instant). Never send messages "
+        "automatically: show drafts to the user."
     ),
     host="0.0.0.0",
     port=PORT,
@@ -70,10 +72,43 @@ FREELANCE_WORDS = ("freelance", "contract", "contractor", "part-time", "part tim
 
 def _http() -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
+        timeout=httpx.Timeout(HTTP_TIMEOUT, connect=4.0),
+        headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"},
         follow_redirects=True,
+        limits=httpx.Limits(max_connections=40, max_keepalive_connections=20, keepalive_expiry=60),
     )
+
+
+# One warm client per event loop: keeps TCP/TLS connections open between tool
+# calls, so the 2nd search skips DNS + TLS handshakes (~100-300 ms per host).
+_clients: dict[int, tuple[Any, httpx.AsyncClient, Any]] = {}
+
+
+class _Borrowed:
+    """`async with _client() as c` that does NOT close the shared client."""
+
+    def __init__(self, c: httpx.AsyncClient):
+        self.c = c
+
+    async def __aenter__(self) -> httpx.AsyncClient:
+        return self.c
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+def _client() -> _Borrowed:
+    loop = asyncio.get_running_loop()
+    hit = _clients.get(id(loop))
+    if hit and hit[0] is loop and not hit[1].is_closed and hit[2] is _http:
+        return _Borrowed(hit[1])
+    c = _http()
+    _clients.clear()  # old loops are gone (serverless / tests)
+    _clients[id(loop)] = (loop, c, _http)
+    return _Borrowed(c)
+
+
+_inflight: dict[str, asyncio.Future] = {}
 
 
 async def _get(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response:
@@ -81,10 +116,26 @@ async def _get(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response:
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL:
         return hit[1]
-    r = await client.get(url, **kw)
-    r.raise_for_status()
-    _cache[key] = (time.time(), r)
-    return r
+    fut = _inflight.get(key)  # same URL already being fetched -> share it
+    if fut is not None and not fut.done():
+        return await asyncio.shield(fut)
+    fut = asyncio.get_running_loop().create_future()
+    _inflight[key] = fut
+    try:
+        r = await client.get(url, **kw)
+        r.raise_for_status()
+        if len(_cache) >= CACHE_MAX:
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[: CACHE_MAX // 4]:
+                _cache.pop(k, None)
+        _cache[key] = (time.time(), r)
+        fut.set_result(r)
+        return r
+    except BaseException as e:
+        fut.set_exception(e)
+        fut.exception()  # mark retrieved
+        raise
+    finally:
+        _inflight.pop(key, None)
 
 
 def _strip_html(text: str | None, limit: int = 600) -> str:
@@ -157,7 +208,7 @@ def _matches(lead: dict, keywords: list[str]) -> int:
 
 
 def _is_freelance(lead: dict) -> bool:
-    text = " ".join([lead["job_type"], lead["title"], lead["summary"]]).lower()
+    text = " ".join([lead.get("job_type", ""), lead.get("title", ""), lead.get("summary", "")]).lower()
     return any(w in text for w in FREELANCE_WORDS)
 
 
@@ -275,17 +326,25 @@ async def src_hackernews(c: httpx.AsyncClient, keywords: list[str]) -> list[dict
         elif "who is hiring" in t and "hiring" not in threads:
             threads["hiring"] = h["objectID"]
     out = []
-    for kind, story_id in threads.items():
+
+    async def comments(story_id: str):
         params = {"tags": f"comment,story_{story_id}", "hitsPerPage": 100}
         if keywords:
             params["query"] = " ".join(keywords[:1])
-        cr = await _get(c, "https://hn.algolia.com/api/v1/search", params=params)
+        return await _get(c, "https://hn.algolia.com/api/v1/search", params=params)
+
+    kinds = list(threads.items())
+    responses = await asyncio.gather(*[comments(sid) for _, sid in kinds])  # both threads at once
+    for (kind, story_id), cr in zip(kinds, responses):
         for h in cr.json().get("hits", []):
             text = h.get("comment_text") or ""
             if h.get("parent_id") and str(h.get("parent_id")) != str(story_id):
                 continue  # only top-level posts
-            if kind == "freelancer" and "seeking freelancer" not in text.lower():
+            low = text.lower()
+            if kind == "freelancer" and "seeking freelancer" not in low:
                 continue  # skip 'SEEKING WORK' posts (those are other freelancers)
+            if _JOB_SEEKER.search(low[:400]):
+                continue  # people looking for work, not clients
             first_line = _strip_html(text.split("<p>")[0], 160)
             out.append(_lead(
                 f"hackernews-{kind}", first_line or "HN hiring post",
@@ -296,6 +355,9 @@ async def src_hackernews(c: httpx.AsyncClient, keywords: list[str]) -> list[dict
             ))
     return out
 
+
+_JOB_SEEKER = re.compile(r"seeking work|willing to relocate|r[ée]sum[ée]/cv|looking for (full-time|a job|work)|"
+                         r"i'?m (currently )?(open to|looking for|seeking)")
 
 _reddit_token: dict[str, Any] = {}
 
@@ -341,7 +403,7 @@ async def src_reddit(c: httpx.AsyncClient, keywords: list[str]) -> list[dict]:
     return out
 
 
-SOURCES = {
+SOURCES: dict[str, Any] = {
     "remotive": src_remotive,
     "remoteok": src_remoteok,
     "weworkremotely": src_weworkremotely,
@@ -350,47 +412,69 @@ SOURCES = {
     "hackernews": src_hackernews,
     "reddit": src_reddit,
 }
+_BUILTIN_SOURCES = set(SOURCES)
 
 
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+def _compact(ld: dict, summary_chars: int) -> dict:
+    """Small lead: only fields with a value, short summary -> model reads it faster."""
+    out = {k: v for k, v in ld.items() if v not in ("", None, [], {})}
+    if out.get("company") and out["company"] == out.get("title"):
+        out.pop("company")
+    if "summary" in out and len(out["summary"]) > summary_chars:
+        out["summary"] = out["summary"][:summary_chars].rstrip() + "..."
+    if "tags" in out:
+        out["tags"] = out["tags"][:5]
+    if out.get("posted_at"):
+        out["posted_at"] = out["posted_at"][:10]
+    return out
+
+
+def _default_sources() -> list[str]:
+    # Reddit blocks cloud IPs without OAuth (403), so don't waste time on it by default.
+    return [s for s in SOURCES if s != "reddit" or (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)]
+
+
 @mcp.tool()
 async def find_freelance_leads(
     keywords: list[str],
     sources: list[str] | None = None,
     freelance_only: bool = False,
     posted_within_days: int = 30,
-    max_results: int = 30,
+    max_results: int = 20,
+    detail: str = "compact",
 ) -> dict:
-    """Search many public job boards and hiring threads at once for leads.
+    """Search all job boards + hiring threads in parallel (~1-3 s, cached 10 min).
 
     Args:
-        keywords: Skills or services to look for, e.g. ["python", "django"] or
-            ["logo design"] or ["shopify"]. The first keyword is also sent to
-            sources that support server-side search.
-        sources: Optional subset of: remotive, remoteok, weworkremotely, jobicy,
-            himalayas, hackernews, reddit. Default: all.
-        freelance_only: Keep only leads that look like freelance / contract /
-            part-time / project work.
-        posted_within_days: Drop leads older than this many days.
-        max_results: Maximum leads to return (best matches first).
-
-    Returns leads sorted by match score and recency, plus per-source status.
+        keywords: Skills, e.g. ["python", "django"], ["shopify"]. First one is
+            also sent to boards with server-side search.
+        sources: Optional subset (see list_sources). Default: all working ones.
+        freelance_only: Only freelance / contract / part-time / project work.
+        posted_within_days: Drop older leads.
+        max_results: Max leads returned (best first).
+        detail: "compact" (short summaries, fast to read) or "full".
     """
-    chosen = [s for s in (sources or SOURCES) if s in SOURCES]
+    t0 = time.perf_counter()
+    chosen = [s for s in (sources or _default_sources()) if s in SOURCES]
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, posted_within_days))
     status: dict[str, str] = {}
     leads: list[dict] = []
 
-    async with _http() as c:
+    async with _client() as c:
         async def run(name: str):
+            ts = time.perf_counter()
             try:
-                res = await SOURCES[name](c, keywords)
-                status[name] = f"ok ({len(res)} fetched)"
+                res = await asyncio.wait_for(SOURCES[name](c, keywords), SOURCE_TIMEOUT)
+                status[name] = f"ok {len(res)} in {int((time.perf_counter() - ts) * 1000)}ms"
                 return res
+            except asyncio.TimeoutError:
+                status[name] = f"skipped: slower than {SOURCE_TIMEOUT:g}s"
+                return []
             except Exception as e:  # one failing source must not break the rest
-                status[name] = f"error: {type(e).__name__}: {str(e)[:150]}"
+                status[name] = f"error: {type(e).__name__}: {str(e)[:100]}"
                 return []
 
         for res in await asyncio.gather(*[run(s) for s in chosen]):
@@ -405,24 +489,26 @@ async def find_freelance_leads(
         score = _matches(ld, keywords)
         if score == 0:
             continue
-        if freelance_only and not _is_freelance(ld):
+        free = _is_freelance(ld)
+        if freelance_only and not free:
             continue
         d = _parse_date(ld["posted_at"])
         if d and d < cutoff:
             continue
-        if _is_freelance(ld):
+        if free:
             score += 2
         ld["match_score"] = score
         ranked.append(ld)
 
     ranked.sort(key=lambda x: (x["match_score"], x["posted_at"] or ""), reverse=True)
+    top = ranked[: max(1, min(max_results, 100))]
+    if detail != "full":
+        top = [_compact(ld, 220) for ld in top]
     return {
-        "query": {"keywords": keywords, "sources": chosen, "freelance_only": freelance_only,
-                  "posted_within_days": posted_within_days},
         "total_matches": len(ranked),
-        "leads": ranked[: max(1, min(max_results, 100))],
+        "took_ms": int((time.perf_counter() - t0) * 1000),
+        "leads": top,
         "source_status": status,
-        "tip": "Also try the Upwork and Fiverr connectors if they are connected in Claude.",
     }
 
 
@@ -437,7 +523,8 @@ def list_sources() -> dict:
             "jobicy": "Jobicy remote jobs API",
             "himalayas": "Himalayas remote jobs API",
             "hackernews": "HN monthly 'Freelancer? Seeking freelancer?' + 'Who is hiring?' threads",
-            "reddit": "r/forhire, r/hiring, r/freelance_forhire, r/jobbit, r/HireAWriter, r/DesignJobs ([Hiring] posts only)",
+            "reddit": "r/forhire, r/hiring, ... ([Hiring] posts only). Needs REDDIT_CLIENT_ID/SECRET in the cloud (else 403, skipped by default)",
+            **{k: "plugin source" for k in SOURCES if k not in _BUILTIN_SOURCES},
         },
         "reddit_oauth_configured": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET),
         "web_search_configured": bool(BRAVE_API_KEY),
@@ -456,7 +543,7 @@ async def web_search_leads(query: str, count: int = 15) -> dict:
     if not BRAVE_API_KEY:
         return {"error": "BRAVE_API_KEY is not set on the server. Get a free key at "
                          "https://brave.com/search/api/ and add it as an env var."}
-    async with _http() as c:
+    async with _client() as c:
         r = await _get(c, "https://api.search.brave.com/res/v1/web/search",
                        params={"q": query, "count": max(1, min(count, 20)), "freshness": "pm"},
                        headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"})
@@ -488,7 +575,7 @@ async def get_lead_details(url: str, max_chars: int = 6000) -> dict:
     """
     if urlparse(url).scheme not in ("http", "https"):
         return {"error": "Only http(s) URLs are supported."}
-    async with _http() as c:
+    async with _client() as c:
         try:
             m = re.search(r"news\.ycombinator\.com/item\?id=(\d+)", url)
             if m:
@@ -559,15 +646,22 @@ def daily_lead_hunt(skills: str) -> str:
     )
 
 
-# GitHub management tools (need GITHUB_TOKEN)
-import github_tools  # noqa: E402
+# ---------------------------------------------------------------------------
+# Plugins: every plugins/*.py is loaded automatically (GitHub, cPanel, Vercel,
+# and anything you add later). See plugins/_template.py.
+# ---------------------------------------------------------------------------
+from plugin_loader import load_plugins  # noqa: E402
 
-github_tools.register(mcp)
+PLUGIN_STATUS = load_plugins(mcp, "plugins", lead_sources=SOURCES)
 
-# cPanel + Vercel management tools (need their own env vars)
-import hosting_tools  # noqa: E402
 
-hosting_tools.register(mcp)
+@mcp.tool()
+async def server_status() -> dict:
+    """Health + speed check: loaded plugins, tool count, cache size, timeouts."""
+    tools = await mcp.list_tools()
+    return {"plugins": PLUGIN_STATUS, "tools": len(tools), "lead_sources": list(SOURCES),
+            "cache_entries": len(_cache), "cache_ttl_s": CACHE_TTL,
+            "source_timeout_s": SOURCE_TIMEOUT}
 
 
 # Health check for cloud hosts (Render/Railway ping this).

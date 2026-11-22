@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 import re
 import sys
 import tempfile
@@ -41,6 +42,9 @@ UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", str(Path.home()))  # files must be inside
 TRANSPORT = os.getenv("TRANSPORT", "stdio")  # "http" for cloud hosting
 PORT = int(os.getenv("PORT", "8000"))
 MCP_PATH = os.getenv("MCP_PATH", "/mcp")
+# Speed: skip downloading fonts/video (and images if "images") -> pages load 2-5x faster.
+BLOCK = {x.strip() for x in os.getenv("BROWSER_BLOCK", "font,media").lower().split(",") if x.strip()}
+SETTLE_MS = int(os.getenv("BROWSER_SETTLE_MS", "1200"))  # max wait for network to go quiet
 SENSITIVE = re.compile(
     r"\b(send|submit|post|publish|apply|save|update|confirm|delete|remove|pay|buy|"
     r"purchase|checkout|order|withdraw|transfer|accept|hire|bid|propose|connect)\b",
@@ -50,10 +54,11 @@ SENSITIVE = re.compile(
 mcp = FastMCP(
     "browser-agent",
     instructions=(
-        "Controls a real browser on the user's computer. Workflow: browser_open -> "
-        "browser_snapshot (gives numbered refs) -> browser_click / browser_type / "
-        "browser_upload with those refs -> browser_snapshot again to check. Use "
-        "browser_screenshot when layout or images matter. Before any action that "
+        "Controls a real browser. FAST flow: browser_open already returns a compact "
+        "snapshot (lines like `[12] button \"Save\"`). Then do several steps in ONE "
+        "call with browser_act (click/type/select/key/scroll/wait/open) - it returns a "
+        "fresh snapshot at the end, so no separate snapshot call is needed. Use "
+        "browser_screenshot only when layout or images matter. Before any action that "
         "sends, posts, saves, pays or deletes, show the user exactly what will happen "
         "and only call with confirm=true after they agree. Never enter passwords; ask "
         "the user to log in themselves (or import their cookies with browser_import_cookies)."
@@ -87,12 +92,16 @@ SNAPSHOT_JS = r"""
     if (r.width < 2 || r.height < 2 || st.visibility === 'hidden' || st.display === 'none') continue;
     if (el.type === 'hidden') continue;
     n += 1; el.setAttribute('data-mcp-ref', String(n));
-    const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder ||
-                  el.title || el.alt || el.name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    const field = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
+    const lbl = field && el.labels && el.labels[0] ? el.labels[0].innerText : '';
+    const name = (el.getAttribute('aria-label') ||
+                  (field ? (lbl || el.placeholder || el.name || el.title) : (el.innerText || el.title || el.alt)) ||
+                  el.value || '').trim().replace(/\s+/g, ' ').slice(0, 80);
     const inView = r.bottom > 0 && r.top < innerHeight;
     out.push({ref: n, tag: el.tagName.toLowerCase(), type: el.type || el.getAttribute('role') || '',
               name, href: el.href ? String(el.href).slice(0, 120) : undefined,
-              value: (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.type !== 'password'
+              value: el.tagName === 'SELECT' ? (el.selectedOptions[0] || {}).text :
+                     (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.type !== 'password'
                      ? String(el.value || '').slice(0, 60) : undefined,
               in_view: inView});
     if (out.length >= maxItems) break;
@@ -100,6 +109,65 @@ SNAPSHOT_JS = r"""
   return out;
 }
 """
+
+
+def _fmt_elements(elements: list[dict], only_in_view: bool) -> str:
+    lines = []
+    for e in elements:
+        if only_in_view and not e.get("in_view"):
+            continue
+        tag, typ = e["tag"], e.get("type") or ""
+        if tag == "a":
+            kind = "link"
+        elif tag == "button" or typ in ("submit", "button"):
+            kind = "button"
+        elif tag in ("input", "select", "textarea"):
+            kind = typ or tag
+        else:
+            kind = typ or tag
+        line = f'[{e["ref"]}] {kind} "{e["name"]}"'
+        if e.get("value"):
+            line += f' ={e["value"]!r}'
+        if e["tag"] == "a" and e.get("href") and not e["name"]:
+            line += f' -> {e["href"]}'
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _snap(page: Page, max_elements: int = 120, text_chars: int = 2500,
+                only_in_view: bool = False) -> dict:
+    """One JS round trip for elements + text (was two)."""
+    data = await page.evaluate(
+        "([n]) => ({els: (" + SNAPSHOT_JS + ")(n), text: document.body ? document.body.innerText : ''})",
+        [max(10, min(max_elements, 400))],
+    )
+    text = re.sub(r"\n\s*\n+", "\n", data["text"] or "").strip()
+    out = {"url": page.url, "title": await page.title(),
+           "elements": _fmt_elements(data["els"], only_in_view)}
+    if text_chars:
+        out["text"] = text[:text_chars]
+        if len(text) > text_chars:
+            out["text_more"] = len(text) - text_chars
+    return out
+
+
+async def _settle(page: Page, ms: int | None = None) -> None:
+    """Wait only as long as needed: DOM ready, then network quiet up to SETTLE_MS."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=ms if ms is not None else SETTLE_MS)
+    except Exception:
+        pass
+
+
+async def _route(route):
+    if route.request.resource_type in BLOCK:
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 async def _page() -> Page:
@@ -115,8 +183,12 @@ async def _page() -> Page:
             PROFILE_DIR, headless=HEADLESS, executable_path=CHROME_PATH,
             viewport={"width": 1366, "height": 860},
         )
+    if BLOCK and not getattr(S, "routed", False):
+        await S.ctx.route("**/*", _route)
+        S.routed = True
     pages = [p for p in S.ctx.pages if not p.is_closed()]
     S.page = pages[-1] if pages else await S.ctx.new_page()
+    S.page.set_default_timeout(8000)
     return S.page
 
 
@@ -138,32 +210,23 @@ async def _summary(page: Page) -> dict:
 
 
 @mcp.tool()
-async def browser_open(url: str) -> dict:
-    """Open a URL in the current tab (adds https:// if missing)."""
+async def browser_open(url: str, snapshot: bool = True) -> dict:
+    """Open a URL (adds https:// if missing). Returns a compact snapshot right away."""
     if not re.match(r"^https?://", url):
         url = "https://" + url
     page = await _page()
-    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=5000)
-    except Exception:
-        pass
-    return await _summary(page)
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await _settle(page)
+    return await _snap(page) if snapshot else await _summary(page)
 
 
 @mcp.tool()
-async def browser_snapshot(max_elements: int = 150, text_chars: int = 4000) -> dict:
-    """See the page: visible text plus numbered interactive elements (refs).
-
-    Use the 'ref' numbers with browser_click, browser_type, browser_select, browser_upload.
-    Refs change when the page changes, so snapshot again after actions.
-    """
-    page = await _page()
-    elements = await page.evaluate(SNAPSHOT_JS, max(10, min(max_elements, 400)))
-    text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-    text = re.sub(r"\n\s*\n+", "\n", text or "").strip()
-    return {**await _summary(page), "text": text[:text_chars],
-            "text_truncated": len(text) > text_chars, "elements": elements}
+async def browser_snapshot(max_elements: int = 120, text_chars: int = 2500,
+                           only_in_view: bool = False) -> dict:
+    """See the page: visible text + numbered interactive elements, one per line:
+    `[12] button "Save"`. Use the numbers as refs. Refs change after the page changes.
+    only_in_view=true lists just what is on screen (smaller, faster)."""
+    return await _snap(await _page(), max_elements, text_chars, only_in_view)
 
 
 @mcp.tool()
@@ -173,63 +236,137 @@ async def browser_screenshot(full_page: bool = False) -> Image:
     return Image(data=await page.screenshot(full_page=full_page, type="jpeg", quality=70), format="jpeg")
 
 
-@mcp.tool()
-async def browser_click(ref: int, confirm: bool = False) -> dict:
-    """Click an element by ref. Buttons like Send/Submit/Post/Save/Delete/Pay need confirm=true
-    (ask the user first)."""
-    page = await _page()
+async def _do_click(page: Page, ref: int, confirm: bool) -> dict:
     name = await _describe(page, ref)
     if SENSITIVE.search(name) and not confirm:
         return {"needs_confirmation": True, "element": name,
                 "message": f"'{name}' looks like a send/save/post/pay action. Ask the user, "
                            "then call again with confirm=true."}
-    await _loc(page, ref).click(timeout=10000)
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=5000)
-    except Exception:
-        pass
-    return {"clicked": name, **await _summary(page)}
+    await _loc(page, ref).click(timeout=8000)
+    await _settle(page, 800)
+    return {"clicked": name}
 
 
-@mcp.tool()
-async def browser_type(ref: int, text: str, clear_first: bool = True, press_enter: bool = False,
-                       confirm: bool = False) -> dict:
-    """Type text into an input / textarea / editor by ref. press_enter=true submits, so it
-    needs confirm=true."""
-    page = await _page()
+async def _do_type(page: Page, ref: int, text: str, clear_first: bool, press_enter: bool,
+                   confirm: bool) -> dict:
     loc = _loc(page, ref)
     await _describe(page, ref)
-    if await loc.evaluate("e => e.type === 'password'"):
+    info = await loc.evaluate("e => ({pw: e.type === 'password', ce: e.isContentEditable})")
+    if info["pw"]:
         return {"error": "Will not type passwords. Ask the user to log in themselves."}
     if press_enter and not confirm:
         return {"needs_confirmation": True, "message": "Pressing Enter may submit the form. "
                 "Ask the user, then call again with confirm=true."}
-    editable = await loc.evaluate("e => e.isContentEditable")
-    if editable:
+    if info["ce"]:
         await loc.click()
         if clear_first:
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Delete")
         await page.keyboard.insert_text(text)
     elif clear_first:
-        await loc.fill(text)
+        await loc.fill(text)  # instant, no per-key delay
     else:
-        await loc.press_sequentially(text)
+        await loc.focus()
+        await page.keyboard.insert_text(text)
     if press_enter:
         await loc.press("Enter")
-    return {"typed_chars": len(text), **await _summary(page)}
+        await _settle(page, 800)
+    return {"typed_chars": len(text)}
+
+
+async def _do_select(page: Page, ref: int, option: str) -> dict:
+    loc = _loc(page, ref)
+    try:
+        chosen = await loc.select_option(label=option, timeout=5000)
+    except Exception:
+        chosen = await loc.select_option(value=option, timeout=5000)
+    return {"selected": chosen}
+
+
+@mcp.tool()
+async def browser_click(ref: int, confirm: bool = False, snapshot: bool = False) -> dict:
+    """Click an element by ref. Buttons like Send/Submit/Post/Save/Delete/Pay need confirm=true
+    (ask the user first). snapshot=true returns the new page view in the same call."""
+    page = await _page()
+    res = await _do_click(page, ref, confirm)
+    if res.get("needs_confirmation"):
+        return res
+    return {**res, **(await _snap(page) if snapshot else await _summary(page))}
+
+
+@mcp.tool()
+async def browser_type(ref: int, text: str, clear_first: bool = True, press_enter: bool = False,
+                       confirm: bool = False) -> dict:
+    """Type text into an input / textarea / editor by ref (instant paste, not key by key).
+    press_enter=true submits, so it needs confirm=true."""
+    page = await _page()
+    res = await _do_type(page, ref, text, clear_first, press_enter, confirm)
+    return res if "typed_chars" not in res else {**res, **await _summary(page)}
+
+
+@mcp.tool()
+async def browser_act(steps: list[dict], confirm: bool = False, snapshot: bool = True) -> dict:
+    """Do many browser steps in ONE call (much faster than one tool call per step).
+
+    steps: list of objects, run in order, e.g.
+      [{"type": 5, "text": "Full-stack developer"},
+       {"type": 7, "text": "I build web apps...", "clear": true},
+       {"select": 9, "option": "Expert"},
+       {"click": 12},
+       {"key": "Tab"}, {"scroll": 800}, {"wait": 500}, {"open": "https://contra.com"}]
+    A step that sends/saves/posts/pays (or {"type":..,"enter":true}) stops the batch with
+    needs_confirmation unless confirm=true. Show the user the whole plan before confirm=true.
+    Returns what each step did, plus a fresh compact snapshot.
+    """
+    page = await _page()
+    done: list[Any] = []
+    for i, st in enumerate(steps[:40]):
+        try:
+            if "click" in st:
+                r = await _do_click(page, int(st["click"]), confirm)
+            elif "type" in st:
+                r = await _do_type(page, int(st["type"]), str(st.get("text", "")),
+                                   bool(st.get("clear", True)), bool(st.get("enter", False)), confirm)
+            elif "select" in st:
+                r = await _do_select(page, int(st["select"]), str(st.get("option", "")))
+            elif "key" in st:
+                if str(st["key"]).lower() == "enter" and not confirm:
+                    r = {"needs_confirmation": True, "message": "Enter may submit. Needs confirm=true."}
+                else:
+                    await page.keyboard.press(str(st["key"]))
+                    r = {"key": st["key"]}
+            elif "scroll" in st:
+                await page.mouse.wheel(0, int(st["scroll"]))
+                await page.wait_for_timeout(120)
+                r = {"scrolled": int(st["scroll"])}
+            elif "wait" in st:
+                await page.wait_for_timeout(int(max(0, min(float(st["wait"]), 10000))))
+                r = {"waited_ms": st["wait"]}
+            elif "open" in st:
+                u = str(st["open"])
+                await page.goto(u if re.match(r"^https?://", u) else "https://" + u,
+                                wait_until="domcontentloaded", timeout=30000)
+                await _settle(page)
+                r = {"opened": page.url}
+            else:
+                r = {"error": f"unknown step {st}"}
+        except Exception as e:
+            r = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+        if r.get("needs_confirmation") or r.get("error"):
+            out = {"done": done, "stopped_at": i, "step": st, **r}
+            if snapshot:
+                out.update(await _snap(page))
+            return out
+        done.append(r)
+    out: dict[str, Any] = {"done": done}
+    out.update(await _snap(page) if snapshot else await _summary(page))
+    return out
 
 
 @mcp.tool()
 async def browser_select(ref: int, option: str) -> dict:
     """Choose an option in a <select> dropdown by its visible label or value."""
-    page = await _page()
-    loc = _loc(page, ref)
-    try:
-        chosen = await loc.select_option(label=option)
-    except Exception:
-        chosen = await loc.select_option(value=option)
-    return {"selected": chosen}
+    return await _do_select(await _page(), ref, option)
 
 
 @mcp.tool()
@@ -269,7 +406,7 @@ async def browser_scroll(direction: str = "down", amount: int = 800) -> dict:
     """Scroll the page up or down by pixels."""
     page = await _page()
     await page.mouse.wheel(0, amount if direction == "down" else -amount)
-    await page.wait_for_timeout(400)
+    await page.wait_for_timeout(120)
     return await _summary(page)
 
 
@@ -287,7 +424,7 @@ async def browser_tabs(switch_to: int | None = None, open_new_url: str | None = 
     await _page()
     if open_new_url:
         S.page = await S.ctx.new_page()
-        await browser_open(open_new_url)
+        await browser_open(open_new_url, snapshot=False)
     pages = [p for p in S.ctx.pages if not p.is_closed()]
     if switch_to is not None and 0 <= switch_to < len(pages):
         S.page = pages[switch_to]
@@ -390,6 +527,12 @@ async def browser_clear_cookies(domain_contains: str = "") -> dict:
 async def health(_request):
     from starlette.responses import JSONResponse
     return JSONResponse({"status": "ok", "service": "browser-agent"})
+
+
+# New browser tools: drop a file into browser_plugins/ and it is loaded automatically.
+from plugin_loader import load_plugins  # noqa: E402
+
+PLUGIN_STATUS = load_plugins(mcp, "browser_plugins")
 
 
 @mcp.prompt()
