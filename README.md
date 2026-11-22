@@ -11,6 +11,23 @@ Cloud server aapki screen nahi dekh sakta, isliye browser wala hissa local hai.
 
 ---
 
+## ⚡ Speed + naye tools apne aap
+
+**Fast kaise hai**
+- Sab job boards ek saath (parallel). Koi board 6 sec se zyada le to use chhod deta hai, aapko wait nahi karna padta (`SOURCE_TIMEOUT_SECONDS`).
+- Connection garam rehta hai (keep-alive) aur 10 min cache: same search dobara turant.
+- Output chhota (`detail="compact"`): khali fields hatao, summary chhoti. Model jaldi padhta hai. Pura chahiye to `detail="full"`.
+- Reddit cloud se 403 deta hai, isliye OAuth keys ke bina by default skip.
+- Browser: `browser_open` turant snapshot deta hai, aur `browser_act` ek hi call me 5-10 kaam kar deta hai. Fonts/video load nahi hote (`BROWSER_BLOCK=font,media`, images bhi rokne ho to `font,media,image`). Network shant hone ka wait max 1.2 sec (`BROWSER_SETTLE_MS`).
+- `server_status` tool: kaunse plugins load hue, kitne tools, cache size.
+
+**Naya tool kaise jodein (auto-register)**
+1. `plugins/_template.py` copy karke `plugins/mera_tool.py` banao (naam `_` se shuru na ho).
+2. Usme `register(mcp)` ke andar `@mcp.tool()` likho. Naya lead source ho to `LEAD_SOURCES = {"naam": fn}`.
+3. GitHub par push karo. Vercel apne aap deploy karega, tool apne aap aa jayega. Kuch aur edit nahi karna.
+4. Koi plugin toot jaye to baaki server chalta rehta hai, error `server_status` me dikhega.
+Browser agent ke liye wahi cheez `browser_plugins/` folder me.
+
 ## 1. Cloud lead server (`server.py`)
 
 **Sources (sab official API / RSS):** Remotive, RemoteOK, We Work Remotely, Jobicy, Himalayas,
@@ -58,7 +75,7 @@ Phir chat me bolo: *"Python aur Django ke freelance leads dhoondo, pichhle 7 din
 
 Claude kisi bhi website par kaam kar sake: profile theek karna, photo badalna, research, usi site par client dhoondna.
 
-**Tools:** `browser_open`, `browser_snapshot` (page ka text + numbered buttons/fields),
+**Tools:** `browser_open` (seedha snapshot bhi deta hai), `browser_act` (ek call me kai steps: type, select, click...), `browser_snapshot` (page ka text + `[12] button "Save"` jaise lines),
 `browser_click`, `browser_type`, `browser_select`, `browser_upload` (photo), `browser_screenshot`,
 `browser_scroll`, `browser_press_key`, `browser_back`, `browser_tabs`, `browser_find_text`, `browser_wait`.
 Prompts: `improve_profile`, `find_clients_on_site`.
@@ -90,7 +107,7 @@ Phir bolo: *"upwork.com par meri profile kholo, padho aur better headline + over
 
 ---
 
-## 3. GitHub, cPanel, Vercel control (`github_tools.py`, `hosting_tools.py`)
+## 3. GitHub, cPanel, Vercel control (`plugins/github_tools.py`, `plugins/hosting_tools.py`)
 Ye `server.py` ke andar hi jude hain (kul 24 tools). Server ki env settings me ye daalo:
 
 | Kya | Env var | Kahan se milega |

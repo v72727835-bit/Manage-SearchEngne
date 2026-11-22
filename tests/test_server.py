@@ -60,10 +60,11 @@ def run(coro):
 
 def setup_function(_):
     server._cache.clear()
+    server._clients.clear()
     server._http = mock_http
 
 def test_all_sources_ok_and_filtering():
-    res = run(server.find_freelance_leads(["python"]))
+    res = run(server.find_freelance_leads(["python"], sources=list(server.SOURCES), detail="full"))
     assert all(v.startswith("ok") for v in res["source_status"].values()), res["source_status"]
     urls = [l["url"] for l in res["leads"]]
     assert "https://remoteok.com/j/old" not in urls          # too old
@@ -95,7 +96,7 @@ def test_web_search_without_key():
     assert "error" in run(server.web_search_leads("x"))
 
 def test_github_confirm_guards():
-    import github_tools
+    from plugins import github_tools
     github_tools.TOKEN = "x"
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
     assert {"github_create_repo", "github_delete_repo", "github_api"} <= set(tools)
@@ -107,7 +108,7 @@ def test_github_confirm_guards():
     assert "needs_confirmation" in str(res)
 
 def test_hosting_guards():
-    import hosting_tools as h
+    from plugins import hosting_tools as h
     h.CPANEL_HOST, h.CPANEL_USER, h.CPANEL_API_TOKEN = "x", "u", "t"
     h.VERCEL_TOKEN = "t"
     for name, args in [("cpanel_uapi", {"module": "Email", "function": "add_pop"}),
@@ -116,3 +117,70 @@ def test_hosting_guards():
                        ("cpanel_domains", {"action": "delete_subdomain", "domain": "a.b.c"}),
                        ("vercel_manage", {"action": "delete_project", "project": "p"})]:
         assert "needs_confirmation" in str(asyncio.run(server.mcp.call_tool(name, args))), name
+
+
+def test_reddit_skipped_by_default_without_oauth():
+    res = run(server.find_freelance_leads(["python"]))
+    assert "reddit" not in res["source_status"]
+    assert res["took_ms"] < 2000
+
+def test_compact_output_is_small():
+    full = run(server.find_freelance_leads(["python"], detail="full"))
+    small = run(server.find_freelance_leads(["python"]))
+    assert len(json.dumps(small)) < len(json.dumps(full))
+    assert all("" not in l.values() for l in small["leads"])
+
+def test_slow_source_is_dropped_fast():
+    async def slow(c, kw):
+        await asyncio.sleep(5)
+        return []
+    server.SOURCES["slowpoke"] = slow
+    old = server.SOURCE_TIMEOUT
+    server.SOURCE_TIMEOUT = 0.3
+    try:
+        t = time.perf_counter()
+        res = run(server.find_freelance_leads(["python"], sources=["slowpoke", "jobicy"]))
+        assert time.perf_counter() - t < 1.5
+        assert res["source_status"]["slowpoke"].startswith("skipped")
+        assert res["leads"]
+    finally:
+        server.SOURCES.pop("slowpoke")
+        server.SOURCE_TIMEOUT = old
+
+def test_same_url_fetched_once_in_parallel():
+    calls = []
+    def h(req):
+        calls.append(str(req.url))
+        return httpx.Response(200, json={"ok": 1})
+    async def go():
+        c = httpx.AsyncClient(transport=httpx.MockTransport(h))
+        await asyncio.gather(*[server._get(c, "https://x.test/a") for _ in range(5)])
+        await server._get(c, "https://x.test/a")  # cached
+    run(go())
+    assert len(calls) == 1
+
+def test_plugins_auto_loaded():
+    assert server.PLUGIN_STATUS["github_tools"]["ok"]
+    assert server.PLUGIN_STATUS["hosting_tools"]["ok"]
+    assert "_template" not in server.PLUGIN_STATUS
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert {"github_whoami", "cpanel_overview", "vercel_manage", "server_status"} <= names
+
+def test_new_plugin_file_is_picked_up(tmp_path, monkeypatch):
+    import plugin_loader
+    from mcp.server.fastmcp import FastMCP
+    pkg = tmp_path / "myplugs"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "extra.py").write_text(
+        "async def src(c, kw):\n    return []\n"
+        "LEAD_SOURCES = {'extra_board': src}\n"
+        "def register(mcp):\n    @mcp.tool()\n    def ping() -> str:\n        return 'pong'\n")
+    (pkg / "broken.py").write_text("raise RuntimeError('boom')\n")
+    monkeypatch.setattr(plugin_loader, "ROOT", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    m, srcs = FastMCP("t"), {}
+    st = plugin_loader.load_plugins(m, "myplugs", lead_sources=srcs)
+    assert st["extra"]["ok"] and "extra_board" in srcs
+    assert not st["broken"]["ok"]
+    assert "ping" in {t.name for t in asyncio.run(m.list_tools())}
