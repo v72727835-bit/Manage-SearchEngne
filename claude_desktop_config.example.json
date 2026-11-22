@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "browser-agent": {
+      "command": "python",
+      "args": ["C:\\lead-finder-mcp\\browser_mcp.py"],
+      "env": {
+        "CHROME_CDP_URL": "http://127.0.0.1:9222",
+        "UPLOAD_ROOT": "C:\\Users\\YOURNAME\\Pictures"
+      }
+    }
+  }
+}
